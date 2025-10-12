@@ -1,4 +1,6 @@
 data/
+data1/
+extra-data/
 class-notebooks/
 .env/
 # Byte-compiled / optimized / DLL files
