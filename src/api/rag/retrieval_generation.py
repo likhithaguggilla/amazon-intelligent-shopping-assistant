@@ -1,11 +1,14 @@
 import openai
-
-from langsmith import traceable, get_current_run_tree
-from pydantic import BaseModel, Field
 import instructor
 import numpy as np
+
+from api.rag.utils.prompt_management import prompt_template_config
+
+from pydantic import BaseModel, Field
+from langsmith import traceable, get_current_run_tree
+
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchValue, Prefetch, FusionQuery, Document
 
 class RAGUsedContext(BaseModel):
     id: str = Field(description="ID of the item used to answer the question.")
@@ -42,12 +45,26 @@ def get_embedding(text, model="text-embedding-3-small"):
     run_type="retriever"
 )
 def retrieve_data(query, qdrant_client, k=5):
-
     query_embedding = get_embedding(query)
-
+ 
     results = qdrant_client.query_points(
-        collection_name="Amazon-items-collection-00",
-        query=query_embedding,
+        collection_name="Amazon-items-collection-01-hybrid-search",
+        prefetch=[
+            Prefetch(
+                query=query_embedding,
+                using="text-embedding-3-small",
+                limit=20
+            ),
+            Prefetch(
+                query=Document(
+                    text=query,
+                    model="qdrant/bm25"
+                ),
+                using="bm25",
+                limit=20
+            )
+        ],
+        query=FusionQuery(fusion="rrf"),
         limit=k,
     )
 
@@ -57,19 +74,18 @@ def retrieve_data(query, qdrant_client, k=5):
     similarity_scores = []
 
     for result in results.points:
-        payload = result.payload or {}
-        retrieved_context_ids.append(payload.get("parent_asin"))
-        retrieved_context.append(payload.get("description"))
-        retrieved_context_ratings.append(payload.get("rating"))
+        retrieved_context_ids.append(result.payload["parent_asin"])
+        retrieved_context.append(result.payload["description"])
+        retrieved_context_ratings.append(result.payload["average_rating"])
         similarity_scores.append(result.score)
-        
 
     return {
         "retrieved_context_ids": retrieved_context_ids,
         "retrieved_context": retrieved_context,
         "retrieved_context_ratings": retrieved_context_ratings,
-        "similarity_scores": similarity_scores
+        "similarity_scores": similarity_scores,
     }
+
 
 
 @traceable(
@@ -93,31 +109,10 @@ def process_context(context):
 )
 def build_prompt(preprocessed_context, question):
 
-    prompt = f"""
-You are a shopping assistant that can answer questions about the products in stock.
+    template = prompt_template_config("src/api/rag/prompts/retrieval_generation.yml", "retrieval_generation")   
+    rendered_prompt = template.render(preprocessed_context=preprocessed_context, question=question)
 
-You will be given a question and a list of context.
-
-Instructtions:
-- You need to answer the question based on the provided context only.
-- Never use word context and refer to it as the available products.
-- As an output you need to provide:
-
-* The answer to the question based on the provided context.
-* The list of the IDs of the chunks that were used to answer the question. Only return the ones that are used in the answer.
-* Short description (1-2 sentences) of the item based on the description provided in the context.
-
-- The short description should have the name of the item.
-- The answer to the question should contain all of the relevant products in the context, returned with a bulleted list of their detailed specifications
-
-Context:
-{preprocessed_context}
-
-Question:
-{question}
-"""
-
-    return prompt
+    return rendered_prompt
 
 
 @traceable(
@@ -180,9 +175,9 @@ def rag_pipeline_wrapper(question, top_k=5):
 
     for item in result.get("references", []):
         payload = qdrant_client.query_points(
-            collection_name="Amazon-items-collection-00",
+            collection_name="Amazon-items-collection-01-hybrid-search",
             query=dummy_vector,
-            # using="text-embedding-3-small",
+            using="text-embedding-3-small",
             limit=1,
             with_payload=True,
             query_filter=Filter(
